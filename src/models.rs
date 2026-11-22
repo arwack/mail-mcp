@@ -165,6 +165,12 @@ pub struct MessageDetail {
     pub body_html: Option<String>,
     /// Attachment metadata (up to `MAX_ATTACHMENTS`)
     pub attachments: Option<Vec<AttachmentInfo>>,
+    /// S/MIME/PGP status when an encrypted/signed structure was detected for
+    /// an account with crypto configured (`MAIL_SMIME_<ID>_ENABLED` /
+    /// `MAIL_PGP_<ID>_ENABLED`). Absent otherwise — including every
+    /// deployment that does not opt in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crypto: Option<crate::crypto::CryptoBlock>,
 }
 
 /// Input: account_id only

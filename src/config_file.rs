@@ -312,6 +312,8 @@ pub(crate) fn is_account_env_key(key: &str) -> bool {
         || is_scoped_key(key, "MAIL_OAUTH2_", OAUTH_ENV_SUFFIXES)
         || is_scoped_key(key, "MAIL_GRAPH_", OAUTH_ENV_SUFFIXES)
         || is_scoped_key(key, "MAIL_EWS_", EWS_ENV_SUFFIXES)
+        || is_scoped_key(key, "MAIL_SMIME_", SMIME_ENV_SUFFIXES)
+        || is_scoped_key(key, "MAIL_PGP_", PGP_ENV_SUFFIXES)
 }
 
 /// Lowercase account id of a scoped account key, if `key` is one.
@@ -519,7 +521,11 @@ fn acquire_save_lock(display: &Path, target: &Path) -> AppResult<File> {
         options.mode(0o600);
         // Do not follow a symlink planted at the lock path. A hit fails the
         // open, so nothing is chmodded or written through the link.
-        options.custom_flags(libc::O_NOFOLLOW);
+        // O_CLOEXEC keeps the lock file description out of forked child
+        // processes: an inherited description would keep the flock alive
+        // after its holder closed it, making concurrent save attempts fail
+        // spuriously with "being edited".
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let file = options.open(&lock_path).map_err(|error| {
         AppError::invalid(format!(
@@ -1097,6 +1103,7 @@ const GLOBAL_KEYS: &[&str] = &[
     "MAIL_MCP_HTTP_HOST",
     "MAIL_MCP_HTTP_PORT",
     "MAIL_MCP_HTTP_PATH",
+    "MAIL_CRYPTO_TIMEOUT_MS",
 ];
 
 const IMAP_ENV_SUFFIXES: &[&str] = &["HOST", "PORT", "SECURE", "USER", "PASS"];
@@ -1111,6 +1118,14 @@ const SMTP_ENV_SUFFIXES: &[&str] = &[
 ];
 const OAUTH_ENV_SUFFIXES: &[&str] = &["PROVIDER", "CLIENT_ID", "CLIENT_SECRET", "REFRESH_TOKEN"];
 const EWS_ENV_SUFFIXES: &[&str] = &["USER", "CLIENT_ID", "CLIENT_SECRET", "REFRESH_TOKEN"];
+const SMIME_ENV_SUFFIXES: &[&str] = &["ENABLED"];
+const PGP_ENV_SUFFIXES: &[&str] = &[
+    "ENABLED",
+    "PASS",
+    "PASS_KEYCHAIN_SERVICE",
+    "PASS_KEYCHAIN_ACCOUNT",
+    "GPG_BIN",
+];
 
 const SETTINGS: &[Field] = &[
     Field {
@@ -1356,6 +1371,27 @@ mod tests {
 
     fn shown(error: &AppError) -> String {
         error.to_string()
+    }
+
+    /// Retry an operation that must succeed once this process' advisory lock
+    /// is released. On macOS, forked child processes (e.g. helper subprocesses
+    /// spawned by unrelated tests running in parallel) briefly inherit the
+    /// lock's open file description between `fork` and `exec`, so an immediate
+    /// re-acquire after `drop` can read a spurious `Conflict` for a few
+    /// microseconds. Bounded retry keeps the tests deterministic without
+    /// changing production semantics: cross-process, an external holder still
+    /// conflicts immediately.
+    fn retry_conflict<T>(mut op: impl FnMut() -> Result<T, AppError>) -> Result<T, AppError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match op() {
+                Ok(value) => return Ok(value),
+                Err(AppError::Conflict(_)) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn no_env() -> Vec<(OsString, OsString)> {
@@ -1681,7 +1717,7 @@ mod tests {
         assert!(saved.contains("# home"), "{saved}");
         assert!(saved.contains("true"), "{saved}");
         let before = fs::read(&path).unwrap();
-        let error = file.save(true).unwrap_err();
+        let error = retry_conflict(|| file.save(true)).unwrap_err();
         assert!(shown(&error).contains("refusing to overwrite"));
         assert_eq!(fs::read(&path).unwrap(), before);
     }
@@ -1906,7 +1942,7 @@ mod tests {
         assert!(matches!(error, AppError::Conflict(_)));
         assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
         drop(held);
-        file.save(false).unwrap();
+        retry_conflict(|| file.save(false)).unwrap();
         let reloaded = ConfigFile::load(Some(&path), false).unwrap();
         assert_eq!(
             reloaded

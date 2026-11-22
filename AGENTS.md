@@ -151,6 +151,9 @@ The repository publishes GitHub Release archives/installers via cargo-dist.
 - `src/errors.rs`: app-level error model and MCP error mapping.
 - `src/imap.rs`: IMAP transport/session operations with timeout wrappers.
 - `src/server.rs`: MCP tool handlers, validation, business orchestration.
+- `src/crypto/`: opt-in S/MIME+PGP read-path decryption (`mod.rs` config/
+  orchestration/cache, `detect.rs` pure structure detection, `backend.rs`
+  backend trait, `subprocess.rs` `security cms`/`gpg` helpers).
 - `src/models.rs`: input/output DTOs and schema-bearing types.
 - `src/mime.rs`: message parsing, header/body extraction, sanitization.
 - `src/message_id.rs`: stable message id parse/encode logic.
@@ -271,6 +274,24 @@ The repository publishes GitHub Release archives/installers via cargo-dist.
   `imap_search_all_mailboxes` (default `4`, clamped to `1..=8`). Each connection
   walks its share of the mailboxes with EXAMINE + UID SEARCH; providers cap
   concurrent connections per account, so stay well below their limit.
+- `MAIL_SMIME_<ID>_ENABLED` / `MAIL_PGP_<ID>_ENABLED`: opt-in transparent
+  read-path decryption (`imap_get_message`/`imap_get_attachment`) of S/MIME
+  and PGP/MIME mail, per account, default off. Without any of these keys the
+  server is byte-identical (no crypto code path, no subprocess) — keep that
+  guarantee intact when touching `src/crypto/` or the server integration
+  (inert tests in `src/crypto/mod.rs`). Step-1 backends are subprocesses
+  (`/usr/bin/security cms -D` on macOS for S/MIME; `gpg` for PGP, passphrase
+  via stdin fd 0) behind the `DecryptBackend` trait
+  (`src/crypto/backend.rs`) — a native-Rust backend replaces them there
+  without touching orchestration. PGP secrets: `MAIL_PGP_<ID>_PASS` (env) or
+  `MAIL_PGP_<ID>_PASS_KEYCHAIN_SERVICE`/`_ACCOUNT` (macOS keychain, lookup
+  via `security find-generic-password -w`); never log or echo either.
+  `MAIL_PGP_<ID>_GPG_BIN` overrides the gpg binary.
+  `MAIL_CRYPTO_TIMEOUT_MS` (default `30000`) bounds every helper subprocess.
+  Decryption failures are per-message metadata (`crypto` block), never tool
+  errors; decrypted content is never logged and cached in memory only
+  (TTL/entry-capped). Linux S/MIME backend (openssl/gpgsm) is the follow-up
+  step before any upstream PR.
 
 ## Quick Pre-Commit Checklist
 

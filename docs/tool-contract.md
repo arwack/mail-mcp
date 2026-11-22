@@ -466,6 +466,17 @@ Server-wide:
 - `MAIL_IMAP_MAX_MAILBOXES` (default `200`, clamped to `1..=10000`): cap for `imap_list_mailboxes`
 - `MAIL_IMAP_SEARCH_CONCURRENCY` (default `4`, clamped to `1..=8`): parallel connections for `imap_search_all_mailboxes`
 - `MAIL_OAUTH2_TOKEN_STORE` (default unset): file path where rotated OAuth2 refresh tokens are persisted; see `docs/advanced-configuration.md#oauth2-token-store`
+- `MAIL_CRYPTO_TIMEOUT_MS` (default `30000`): wall-clock budget for one crypto helper subprocess (S/MIME `security cms` / PGP `gpg`); decryption failures are reported per message, never fatal
+
+Optional S/MIME + PGP read path (per account; all default off — see
+[the section below](#smime-and-pgp-read-path-optional)):
+
+- `MAIL_SMIME_<ACCOUNT>_ENABLED` (default `false`): transparent decryption of incoming S/MIME in `imap_get_message`/`imap_get_attachment`
+- `MAIL_PGP_<ACCOUNT>_ENABLED` (default `false`): same for PGP/MIME and inline PGP, via `gpg`
+- `MAIL_PGP_<ACCOUNT>_PASS` (optional): PGP key passphrase from the environment
+- `MAIL_PGP_<ACCOUNT>_PASS_KEYCHAIN_SERVICE` (optional, macOS): keychain item holding the passphrase (lookup via `security find-generic-password -w -s <service>`); `MAIL_PGP_<ACCOUNT>_PASS` wins when both are set
+- `MAIL_PGP_<ACCOUNT>_PASS_KEYCHAIN_ACCOUNT` (optional, macOS): account name for the keychain item
+- `MAIL_PGP_<ACCOUNT>_GPG_BIN` (default `gpg`): gpg binary override
 
 Transport (see `docs/advanced-configuration.md#remote-http-transport`):
 
@@ -473,6 +484,42 @@ Transport (see `docs/advanced-configuration.md#remote-http-transport`):
 - `MAIL_MCP_HTTP_HOST` (default `127.0.0.1`)
 - `MAIL_MCP_HTTP_PORT` (default `8000`)
 - `MAIL_MCP_HTTP_PATH` (default `/mcp`)
+
+## S/MIME and PGP Read Path (Optional)
+
+Opt-in, presence-based decryption of encrypted mail. Without the
+`MAIL_SMIME_<ACCOUNT>_ENABLED` / `MAIL_PGP_<ACCOUNT>_ENABLED` settings the
+server registers no crypto code path at all: behavior, responses, and the
+tool schema are byte-identical to a build without the feature.
+
+With an account opted in:
+
+- `imap_get_message` detects S/MIME enveloped-data, S/MIME opaque
+  signed-data, PGP/MIME, and inline PGP. Encrypted messages are decrypted
+  transparently and returned as if they had never been encrypted (body and
+  attachments from the inner content; envelope headers preserved). The raw
+  `smime.p7m` / `encrypted.asc` part stays downloadable via
+  `imap_get_attachment` for manual fallback.
+- The response carries a `crypto` block: `{ scheme, encrypted, decrypted,
+  signed?, verified?, signer_cn?, signer_email?, failure_reason?,
+  original_part_id, inner_part_prefix }`. `decrypted: false` plus a bounded
+  `failure_reason` explains a fail-open fallback to the original view; the
+  tool call itself never fails because of decryption.
+- Attachment parts inside decrypted content get part ids with the
+  `inner_part_prefix` (`d1.2`); `imap_get_attachment` resolves them (and
+  falls back to inner filename matching) transparently.
+- Sign-then-envelop nesting (an opaque `signed-data` part inside the
+  decrypted MIME) is unwrapped automatically. Signature verification is
+  best-effort in this step: `verified` is `null` unless the helper actually
+  verified (gpg does; `security cms` extraction does not validate chains).
+
+Platform backends (step 1): S/MIME uses `/usr/bin/security cms -D` (macOS;
+the private key never leaves the login keychain). PGP uses `gpg` with the
+passphrase fed on stdin (fd 0) — from `MAIL_PGP_<ACCOUNT>_PASS` or the
+macOS keychain. On platforms without a backend, detected structures get a
+`crypto` block with a clear `failure_reason`. Decrypted content is never
+logged; successful decryptions are cached in memory (bounded) so a body
+read plus attachment downloads decrypt once.
 
 ## Implementation Notes for Next Artifact
 

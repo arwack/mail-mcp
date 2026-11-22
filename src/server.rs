@@ -69,6 +69,9 @@ pub struct MailImapServer {
     graph_token_manager: Option<Arc<crate::oauth2::TokenManager>>,
     /// OAuth2 token manager for EWS
     ews_token_manager: Option<Arc<crate::oauth2::TokenManager>>,
+    /// Transparent S/MIME+PGP read-path decryption. `None` when no account
+    /// opts in — the server then stays fully inert.
+    crypto: Option<Arc<crate::crypto::CryptoService>>,
     /// Update notice if a newer version is available
     update_notice: Option<String>,
     /// Tool router for dispatching MCP tool calls
@@ -113,12 +116,14 @@ impl MailImapServer {
                 token_store,
             )))
         };
+        let crypto = crate::crypto::CryptoService::opt_new(&config.crypto);
         Self {
             config: Arc::new(config),
             cursors: Arc::new(Mutex::new(cursor_store)),
             token_manager,
             graph_token_manager,
             ews_token_manager,
+            crypto,
             update_notice,
             tool_router: Self::tool_router(),
         }
@@ -2152,6 +2157,25 @@ impl MailImapServer {
             }
         };
 
+        // Transparent crypto read path: no-op (and zero cost) without crypto
+        // config; otherwise decrypts detected S/MIME/PGP structures and
+        // replaces the view with the decrypted inner content.
+        let mut parsed = parsed;
+        let crypto_block = self
+            .apply_crypto(
+                &input.account_id,
+                &encoded_message_id,
+                &raw,
+                &mut parsed,
+                &crate::crypto::InnerViewLimits {
+                    body_max_chars: input.body_max_chars,
+                    include_html: input.include_html,
+                    extract_attachment_text: input.extract_attachment_text,
+                    attachment_text_max_chars,
+                },
+            )
+            .await;
+
         let headers = if input.include_headers || input.include_all_headers {
             Some(mime::curated_headers(
                 &parsed.headers_all,
@@ -2206,6 +2230,7 @@ impl MailImapServer {
                     .take(MAX_ATTACHMENTS)
                     .collect(),
             ),
+            crypto: crypto_block,
         };
 
         let status = status_from_issue_and_counts(&issues, true);
@@ -2223,6 +2248,60 @@ impl MailImapServer {
             "account_id": input.account_id,
             "message": detail,
         }))
+    }
+
+    /// Resolve the transparent crypto read path for one message.
+    ///
+    /// Returns the `crypto` metadata block when an encrypted/signed structure
+    /// was detected for a crypto-configured account. On success, `parsed` is
+    /// replaced with the decrypted inner view (body and attachments; headers
+    /// stay from the envelope); inner attachment part ids get the crypto
+    /// inner prefix so `imap_get_attachment` can resolve them. Failures are
+    /// fail-open: the original view plus a `crypto` block explaining why.
+    async fn apply_crypto(
+        &self,
+        account_id: &str,
+        encoded_message_id: &str,
+        raw: &[u8],
+        parsed: &mut mime::ParsedMessage,
+        limits: &crate::crypto::InnerViewLimits,
+    ) -> Option<crate::crypto::CryptoBlock> {
+        let service = self.crypto_for(account_id)?;
+        let resolution = service.resolve(account_id, encoded_message_id, raw).await?;
+        let mut block = resolution.block;
+        if let Some(inner) = resolution.inner {
+            match mime::parse_message(
+                &inner,
+                limits.body_max_chars,
+                limits.include_html,
+                limits.extract_attachment_text,
+                limits.attachment_text_max_chars,
+            ) {
+                Ok(inner_parsed) => {
+                    parsed.body_text = inner_parsed.body_text;
+                    parsed.body_html_sanitized = inner_parsed.body_html_sanitized;
+                    parsed.attachments = inner_parsed
+                        .attachments
+                        .into_iter()
+                        .map(|mut attachment| {
+                            attachment.part_id = format!(
+                                "{}{}",
+                                crate::crypto::INNER_PART_PREFIX,
+                                attachment.part_id
+                            );
+                            attachment
+                        })
+                        .collect();
+                }
+                Err(_) => {
+                    block.decrypted = false;
+                    block.signed = None;
+                    block.verified = None;
+                    block.failure_reason = Some("decrypted content failed MIME parsing".to_owned());
+                }
+            }
+        }
+        Some(block)
     }
 
     async fn get_attachment_impl(&self, input: GetAttachmentInput) -> AppResult<serde_json::Value> {
@@ -2299,11 +2378,29 @@ impl MailImapServer {
         };
 
         let attachments = mime::collect_attachments(&raw)?;
-        let selected = select_attachment(
+        let mut selected = select_attachment(
             &attachments,
             input.part_id.as_deref(),
             input.filename.as_deref(),
-        );
+        )
+        .cloned();
+        // Fall back to attachment parts inside decrypted content (part ids
+        // with the crypto inner prefix, or a filename match). No-op without
+        // crypto config; the raw smime.p7m/encrypted.asc parts above stay
+        // directly downloadable for the manual-recipe fallback.
+        if selected.is_none()
+            && let Some(service) = self.crypto_for(&input.account_id)
+        {
+            selected = service
+                .select_inner_attachment(
+                    &input.account_id,
+                    &encoded_message_id,
+                    &raw,
+                    input.part_id.as_deref(),
+                    input.filename.as_deref(),
+                )
+                .await;
+        }
         let Some(att) = selected else {
             return Err(AppError::NotFound(format!(
                 "no attachment matched the given selector; message has {} attachment(s)",
@@ -5163,6 +5260,15 @@ fn select_attachment<'a>(
         });
     }
     None
+}
+
+impl MailImapServer {
+    /// Crypto service when the given account opted into S/MIME/PGP
+    /// decryption; `None` otherwise (inert).
+    fn crypto_for(&self, account_id: &str) -> Option<&Arc<crate::crypto::CryptoService>> {
+        let service = self.crypto.as_ref()?;
+        service.has_account(account_id).then_some(service)
+    }
 }
 
 /// Derive a safe on-disk file name from an attachment's declared filename.

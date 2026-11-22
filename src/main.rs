@@ -29,6 +29,7 @@ mod cli;
 mod cli_accounts;
 mod config;
 mod config_file;
+mod crypto;
 mod errors;
 mod ews;
 mod graph;

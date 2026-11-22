@@ -765,6 +765,30 @@ To limit which local files send tools may attach via `file_path`, set
 `MAIL_ATTACHMENT_UPLOAD_DIR`; paths outside it (including via `..` or
 symlinks) are rejected. See [docs/security.md](docs/security.md#outbound-attachment-scope).
 
+### S/MIME and PGP Decryption (optional)
+
+Incoming encrypted mail decrypts transparently when an account opts in:
+
+```
+MAIL_SMIME_<ID>_ENABLED=true     # S/MIME via macOS Keychain identity (security cms)
+MAIL_PGP_<ID>_ENABLED=true       # PGP via gpg
+MAIL_PGP_<ID>_PASS=...           # or MAIL_PGP_<ID>_PASS_KEYCHAIN_SERVICE=<keychain item> (macOS)
+```
+
+With crypto enabled, `imap_get_message` returns encrypted messages as if they
+had never been encrypted — decrypted body and attachments, envelope headers
+preserved, plus a `crypto` metadata block (`scheme`, `encrypted`, `decrypted`,
+`signed`/`verified` when known, `failure_reason` on fallback). Attachment parts
+inside decrypted content carry a `d`-prefixed `part_id` and download normally
+through `imap_get_attachment`. Decryption failures never fail the tool call:
+the original view is returned with the reason. Without these settings the
+server is completely unchanged — no extra tools, no schema difference, no
+subprocess ever spawned.
+
+S/MIME currently requires macOS (the private key never leaves the login
+keychain); PGP works wherever `gpg` is installed. See
+[docs/tool-contract.md](docs/tool-contract.md#smime-and-pgp-read-path-optional).
+
 ### Bulk Operations (2 tools)
 
 | Tool | What it does |

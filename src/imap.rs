@@ -1511,6 +1511,7 @@ mod tests {
             attachment_download_dir: None,
             attachment_upload_dir: None,
             oauth2_token_store: None,
+            crypto: crate::crypto::CryptoConfig::default(),
         }
     }
 
@@ -1540,6 +1541,7 @@ mod tests {
             attachment_download_dir: None,
             attachment_upload_dir: None,
             oauth2_token_store: None,
+            crypto: crate::crypto::CryptoConfig::default(),
         }
     }
 

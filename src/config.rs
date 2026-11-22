@@ -123,6 +123,9 @@ pub struct ServerConfig {
     /// (`MAIL_OAUTH2_TOKEN_STORE`). `None` = rotated tokens live in memory
     /// only and the env token is used again after a restart.
     pub oauth2_token_store: Option<PathBuf>,
+    /// S/MIME + PGP read-path settings (`MAIL_SMIME_*` / `MAIL_PGP_*`).
+    /// Empty (and thus fully inert) when no account opts in.
+    pub crypto: crate::crypto::CryptoConfig,
 }
 
 impl ServerConfig {
@@ -230,6 +233,7 @@ impl ServerConfig {
                 .map(|path| path.trim())
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from),
+            crypto: crate::crypto::CryptoConfig::load(settings)?,
         })
     }
 
@@ -637,7 +641,7 @@ fn required_setting(settings: &Settings, key: &str) -> AppResult<String> {
 ///
 /// Returns `InvalidInput` if the setting is present but unrecognized. The
 /// value is omitted so a misplaced secret is not echoed.
-fn parse_bool_setting(settings: &Settings, key: &str, default: bool) -> AppResult<bool> {
+pub(crate) fn parse_bool_setting(settings: &Settings, key: &str, default: bool) -> AppResult<bool> {
     match setting(settings, key) {
         Some(v) => parse_bool_value(v)
             .ok_or_else(|| AppError::InvalidInput(format!("invalid boolean setting {key}"))),
@@ -710,7 +714,7 @@ fn parse_u16_setting(settings: &Settings, key: &str, default: u16) -> AppResult<
 }
 
 /// Parse a `u64` setting, returning `default` when unset.
-fn parse_u64_setting(settings: &Settings, key: &str, default: u64) -> AppResult<u64> {
+pub(crate) fn parse_u64_setting(settings: &Settings, key: &str, default: u64) -> AppResult<u64> {
     match setting(settings, key) {
         Some(v) => v
             .trim()
@@ -828,6 +832,7 @@ mod tests {
             attachment_download_dir: None,
             attachment_upload_dir: None,
             oauth2_token_store: None,
+            crypto: crate::crypto::CryptoConfig::default(),
         }
     }
 
