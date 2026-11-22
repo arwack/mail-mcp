@@ -72,6 +72,107 @@ impl SecurityCmsBackend {
     }
 }
 
+/// The `openssl` binary: absolute on macOS (launchd-proof), PATH lookup
+/// elsewhere.
+fn openssl_bin() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        PathBuf::from("/usr/bin/openssl")
+    } else {
+        PathBuf::from("openssl")
+    }
+}
+
+/// Classify an `openssl smime -verify` failure from its stderr. Digest or
+/// signature failures mean the signature is invalid (content mismatch or
+/// tampering); anything else is an operational failure where validity is
+/// simply not determinable.
+fn classify_openssl_verify_failure(stderr: &[u8]) -> SignatureStatus {
+    let reason = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if reason.contains("digest failure") || reason.contains("signature failure") {
+        SignatureStatus::Bad
+    } else {
+        SignatureStatus::Unverified
+    }
+}
+
+/// Verify an opaque S/MIME `signed-data` payload with openssl: on success
+/// the content is printed to stdout and the signature digest is valid.
+/// Returns `Ok(outcome)` or the raw command failure for the caller to
+/// classify.
+async fn signed_content_openssl(
+    der: &[u8],
+    timeout: Duration,
+) -> Result<DecryptOutcome, (CryptoErrorKind, Vec<u8>, Vec<u8>)> {
+    let input = write_temp_file(der)
+        .await
+        .map_err(|e| (e.kind, Vec::new(), e.message.into_bytes()))?;
+    let args = vec![
+        "smime".to_owned(),
+        "-verify".to_owned(),
+        "-noverify".to_owned(),
+        "-inform".to_owned(),
+        "DER".to_owned(),
+        "-in".to_owned(),
+        input.path().display().to_string(),
+    ];
+    let out = run_helper(&openssl_bin(), &args, None, &[], timeout)
+        .await
+        .map_err(|e| (e.kind, Vec::new(), e.message.into_bytes()))?;
+    if out.status.success() {
+        return Ok(DecryptOutcome {
+            content: out.stdout,
+            signature: Some(SignatureInfo {
+                status: SignatureStatus::Verified,
+                signer: None,
+            }),
+        });
+    }
+    Err((CryptoErrorKind::ProcessFailed, out.stdout, out.stderr))
+}
+
+/// Verify a clear-signed S/MIME message over the whole raw mail:
+/// `openssl smime -verify -noverify -in <raw>`. openssl parses the
+/// multipart/signed structure itself — exactly the semantics the sender's
+/// MUA used when assembling the mail (byte reconstruction of the signed
+/// part would run into the trailing-CRLF ambiguity of detached signatures).
+/// `-noverify` skips the certificate chain check (signer trust is a
+/// separate, future step); the signature digest over the content is fully
+/// checked. Digest/signature failures are reported as an invalid signature
+/// (`Ok(Bad)`), not as an operational error — the invalidity is the
+/// information. Cross-platform: works wherever `openssl` exists.
+async fn verify_clear_signed_openssl(
+    raw_mime: &[u8],
+    timeout: Duration,
+) -> Result<SignatureInfo, CryptoStepError> {
+    let mail_file = write_temp_file(raw_mime).await?;
+    let args = vec![
+        "smime".to_owned(),
+        "-verify".to_owned(),
+        "-noverify".to_owned(),
+        "-in".to_owned(),
+        mail_file.path().display().to_string(),
+    ];
+    let out = run_helper(&openssl_bin(), &args, None, &[], timeout).await?;
+    if out.status.success() {
+        return Ok(SignatureInfo {
+            status: SignatureStatus::Verified,
+            signer: None,
+        });
+    }
+    let status = classify_openssl_verify_failure(&out.stderr);
+    if status == SignatureStatus::Bad {
+        return Ok(SignatureInfo {
+            status,
+            signer: None,
+        });
+    }
+    let reason = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+    Err(CryptoStepError::new(
+        CryptoErrorKind::ProcessFailed,
+        format!("openssl verify failed: {reason}"),
+    ))
+}
+
 impl DecryptBackend for SecurityCmsBackend {
     fn smime_enveloped<'a>(
         &'a self,
@@ -93,15 +194,39 @@ impl DecryptBackend for SecurityCmsBackend {
         timeout: Duration,
     ) -> BoxFuture<'a, Result<DecryptOutcome, CryptoStepError>> {
         Box::pin(async move {
-            let content = Self::cms_decode(der, timeout).await?;
-            Ok(DecryptOutcome {
-                content,
-                signature: Some(SignatureInfo {
-                    status: SignatureStatus::Unverified,
-                    signer: None,
-                }),
-            })
+            // Opaque signed-data carries the content inside the CMS, so
+            // openssl can verify the digest and print the content in one
+            // step (cross-platform).
+            match signed_content_openssl(der, timeout).await {
+                Ok(outcome) => Ok(outcome),
+                Err((_, _, stderr)) => {
+                    // Digest/signature failure: the content is still
+                    // extractable (`security cms -D`, macOS) — surface it
+                    // with the classified status so an invalid signature is
+                    // reported rather than hidden. Operational failures on
+                    // other platforms stay fail-open via the error.
+                    let status = classify_openssl_verify_failure(&stderr);
+                    let content = Self::cms_decode(der, timeout).await?;
+                    Ok(DecryptOutcome {
+                        content,
+                        signature: Some(SignatureInfo {
+                            status,
+                            signer: None,
+                        }),
+                    })
+                }
+            }
         })
+    }
+
+    /// Verify a clear-signed S/MIME message over the whole raw mail via
+    /// `openssl smime -verify -noverify` (cross-platform).
+    fn smime_verify_clear_signed<'a>(
+        &'a self,
+        raw_mime: &'a [u8],
+        timeout: Duration,
+    ) -> BoxFuture<'a, Result<SignatureInfo, CryptoStepError>> {
+        Box::pin(async move { verify_clear_signed_openssl(raw_mime, timeout).await })
     }
 
     fn pgp_decrypt<'a>(
@@ -206,6 +331,19 @@ impl DecryptBackend for GpgBackend {
         _der: &'a [u8],
         _timeout: Duration,
     ) -> BoxFuture<'a, Result<DecryptOutcome, CryptoStepError>> {
+        Box::pin(async move {
+            Err(CryptoStepError::new(
+                CryptoErrorKind::Unsupported,
+                "gpg backend does not handle S/MIME",
+            ))
+        })
+    }
+
+    fn smime_verify_clear_signed<'a>(
+        &'a self,
+        _raw_mime: &'a [u8],
+        _timeout: Duration,
+    ) -> BoxFuture<'a, Result<SignatureInfo, CryptoStepError>> {
         Box::pin(async move {
             Err(CryptoStepError::new(
                 CryptoErrorKind::Unsupported,
@@ -508,6 +646,155 @@ mod signature_tests {
     #[test]
     fn unsigned_message_has_no_signature_info() {
         assert!(classify_gpg_signature(b"gpg: decrypted fine, nothing signed").is_none());
+    }
+}
+
+/// End-to-end openssl signature-verification tests (cross-platform —
+/// `openssl` is a standard tool on every supported platform, so these run
+/// in CI too). Each test generates a throwaway certificate and signs
+/// synthetic content; no real mail is involved.
+#[cfg(test)]
+mod openssl_verify_tests {
+    use std::time::Duration;
+
+    use super::super::SecurityCmsBackend;
+    use super::super::backend::{DecryptBackend, SignatureStatus};
+
+    const TIMEOUT: Duration = Duration::from_secs(30);
+
+    struct Throwaway {
+        dir: tempfile::TempDir,
+        cert: String,
+        key: String,
+    }
+
+    impl Throwaway {
+        /// Throwaway self-signed certificate (used only to sign/verify
+        /// synthetic fixtures inside this test run).
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cert = dir.path().join("cert.pem").display().to_string();
+            let key = dir.path().join("key.pem").display().to_string();
+            let status = std::process::Command::new("openssl")
+                .args([
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-keyout",
+                    &key,
+                    "-out",
+                    &cert,
+                    "-days",
+                    "2",
+                    "-nodes",
+                    "-subj",
+                    "/CN=Crypto Fixture Test",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("openssl req spawn");
+            assert!(status.success(), "fixture certificate generation failed");
+            Self { dir, cert, key }
+        }
+
+        /// Sign content and return the complete multipart/signed mail
+        /// (canonical assembly — the same consistency a real MUA produces).
+        fn sign_clear_signed_mail(&self, content: &[u8]) -> Vec<u8> {
+            let body = self.dir.path().join("body.txt");
+            std::fs::write(&body, content).unwrap();
+            let out = std::process::Command::new("openssl")
+                .args([
+                    "smime",
+                    "-sign",
+                    "-in",
+                    body.display().to_string().as_str(),
+                    "-signer",
+                    &self.cert,
+                    "-inkey",
+                    &self.key,
+                    "-md",
+                    "sha256",
+                ])
+                .output()
+                .expect("openssl smime sign spawn");
+            assert!(out.status.success(), "signing failed");
+            out.stdout
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_signed_mail_verifies_over_whole_raw_message() {
+        let fixture = Throwaway::new();
+        let mail = fixture.sign_clear_signed_mail(b"fixture body line\n");
+        let info = SecurityCmsBackend
+            .smime_verify_clear_signed(&mail, TIMEOUT)
+            .await
+            .expect("verification must succeed");
+        assert_eq!(info.status, SignatureStatus::Verified);
+    }
+
+    #[tokio::test]
+    async fn tampered_clear_signed_mail_reports_bad_signature() {
+        let fixture = Throwaway::new();
+        let mail = fixture.sign_clear_signed_mail(b"original body line\n");
+        let tampered = mail
+            .windows(4)
+            .position(|w| w == b"body")
+            .map(|at| {
+                let mut bytes = mail.clone();
+                bytes[at..at + 4].copy_from_slice(b"BOdy");
+                bytes
+            })
+            .expect("fixture body marker");
+        let info = SecurityCmsBackend
+            .smime_verify_clear_signed(&tampered, TIMEOUT)
+            .await
+            .expect("tampered mail still resolves to a signature status");
+        assert_eq!(info.status, SignatureStatus::Bad);
+    }
+
+    #[tokio::test]
+    async fn opaque_signed_data_extracts_content_and_verifies() {
+        let fixture = Throwaway::new();
+        let body = fixture.dir.path().join("body.txt");
+        std::fs::write(&body, b"opaque fixture body\n").unwrap();
+        let der = fixture.dir.path().join("opaque.der");
+        let status = std::process::Command::new("openssl")
+            .args([
+                "smime",
+                "-sign",
+                "-nodetach",
+                "-in",
+                body.display().to_string().as_str(),
+                "-signer",
+                &fixture.cert,
+                "-inkey",
+                &fixture.key,
+                "-md",
+                "sha256",
+                "-outform",
+                "DER",
+                "-out",
+                der.display().to_string().as_str(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("openssl smime sign spawn");
+        assert!(status.success(), "opaque signing failed");
+        let signed_data = std::fs::read(&der).unwrap();
+
+        let outcome = SecurityCmsBackend
+            .smime_signed_content(&signed_data, TIMEOUT)
+            .await
+            .expect("opaque extraction must succeed");
+        assert!(outcome.content.windows(6).any(|w| w == b"opaque"));
+        assert_eq!(
+            outcome.signature.expect("signature info").status,
+            SignatureStatus::Verified
+        );
     }
 }
 

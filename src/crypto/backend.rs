@@ -95,12 +95,23 @@ pub trait DecryptBackend: Send + Sync {
     ) -> BoxFuture<'a, Result<DecryptOutcome, CryptoStepError>>;
 
     /// Extract the embedded content of an S/MIME opaque `signed-data`
-    /// payload (DER bytes).
+    /// payload (DER bytes) and report signature validity when checkable.
     fn smime_signed_content<'a>(
         &'a self,
         der: &'a [u8],
         timeout: Duration,
     ) -> BoxFuture<'a, Result<DecryptOutcome, CryptoStepError>>;
+
+    /// Verify a clear-signed S/MIME message (`multipart/signed`): the whole
+    /// raw message (exactly as the sender's MUA assembled it — no byte
+    /// reconstruction, which is the classic trailing-CRLF pitfall of
+    /// detached signatures). Content output is not needed: the first part is
+    /// already visible to plain parsing.
+    fn smime_verify_clear_signed<'a>(
+        &'a self,
+        raw_mime: &'a [u8],
+        timeout: Duration,
+    ) -> BoxFuture<'a, Result<SignatureInfo, CryptoStepError>>;
 
     /// Decrypt a PGP payload (armored or binary OpenPGP message).
     fn pgp_decrypt<'a>(

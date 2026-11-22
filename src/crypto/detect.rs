@@ -26,6 +26,9 @@ pub enum CryptoKind {
     SmimeEnveloped,
     /// S/MIME opaque signed-data (content embedded in the CMS structure)
     SmimeSigned,
+    /// S/MIME clear-signed (`multipart/signed` with a detached pkcs7
+    /// signature; the content is visible without any decryption)
+    SmimeClearSigned,
     /// PGP/MIME (`multipart/encrypted`)
     PgpMime,
     /// Inline PGP ASCII armor in a text body
@@ -36,7 +39,9 @@ impl CryptoKind {
     /// Scheme label used in the response `crypto` block.
     pub fn scheme(self) -> &'static str {
         match self {
-            CryptoKind::SmimeEnveloped | CryptoKind::SmimeSigned => "smime",
+            CryptoKind::SmimeEnveloped | CryptoKind::SmimeSigned | CryptoKind::SmimeClearSigned => {
+                "smime"
+            }
             CryptoKind::PgpMime | CryptoKind::PgpInline => "pgp",
         }
     }
@@ -55,18 +60,19 @@ impl CryptoKind {
 pub struct Detected {
     /// Which structure was found
     pub kind: CryptoKind,
-    /// Decoded payload bytes (transfer encoding already undone)
+    /// Decoded payload bytes (transfer encoding already undone): the CMS DER
+    /// for opaque S/MIME kinds, the PGP ciphertext. Clear-signed mail is
+    /// verified over the whole raw message instead (no byte reconstruction).
     pub payload: Vec<u8>,
     /// Outer MIME part id carrying the payload (matches `imap_get_message`
     /// part numbering, e.g. `1` or `1.2`)
     pub part_id: String,
 }
 
-/// Detect a decryptable crypto structure in a raw message.
+/// Detect a decryptable/verifiable crypto structure in a raw message.
 ///
 /// Returns the first match in MIME walk order. `None` for plaintext mail,
-/// clear-signed-only mail, and unsupported `smime-type` values (e.g.
-/// `certs-only`).
+/// and unsupported `smime-type` values (e.g. `certs-only`).
 pub fn detect(raw: &[u8]) -> Option<Detected> {
     let parsed = mailparse::parse_mail(raw).ok()?;
     walk(&parsed, "1")
@@ -75,6 +81,26 @@ pub fn detect(raw: &[u8]) -> Option<Detected> {
 fn walk(part: &ParsedMail<'_>, part_id: &str) -> Option<Detected> {
     if part.subparts.is_empty() {
         return inspect_leaf(part, part_id);
+    }
+
+    // S/MIME clear-signed: `multipart/signed` with a detached pkcs7
+    // signature. The content is visible without decryption; the signature
+    // is verified over the whole raw message (no byte reconstruction — the
+    // sender's MUA assembled it consistently).
+    let ctype = part.ctype.mimetype.to_ascii_lowercase();
+    if ctype == "multipart/signed"
+        && part.subparts.len() >= 2
+        && part.ctype.params.get("protocol").is_some_and(|p| {
+            p.eq_ignore_ascii_case("application/pkcs7-signature")
+                || p.eq_ignore_ascii_case("application/x-pkcs7-signature")
+        })
+    {
+        let payload = part.subparts[1].get_body_raw().ok()?;
+        return Some(Detected {
+            kind: CryptoKind::SmimeClearSigned,
+            payload,
+            part_id: format!("{part_id}.2"),
+        });
     }
 
     // RFC 3156 wraps PGP/MIME in `multipart/encrypted` with a protocol
@@ -218,13 +244,16 @@ Content-Transfer-Encoding: base64\r\n\r\ndGVzdA==\r\n\
     }
 
     #[test]
-    fn ignores_x_pkcs7_signature_clear_signed() {
-        // Clear-signed multipart is visible already; not our job in step 1.
+    fn detects_smime_clear_signed_minimal() {
+        // Same shape the (now removed) negative test used: clear-signed
+        // multipart with a pkcs7 signature is detected for verification.
         let raw = "Content-Type: multipart/signed; protocol=\"application/x-pkcs7-signature\"; micalg=sha-256; boundary=BB\r\n\r\n\
 --BB\r\nContent-Type: text/plain\r\n\r\nvisible body\r\n\
 --BB\r\nContent-Type: application/x-pkcs7-signature\r\nContent-Transfer-Encoding: base64\r\n\r\nQUJD\r\n\
 --BB--\r\n";
-        assert!(detect(raw.as_bytes()).is_none());
+        let hit = detect(raw.as_bytes()).expect("must detect");
+        assert_eq!(hit.kind, CryptoKind::SmimeClearSigned);
+        assert_eq!(hit.part_id, "1.2");
     }
 
     #[test]
@@ -272,6 +301,48 @@ h4IBDQ==\r\n\
         let hit = detect(raw.as_bytes()).expect("must detect");
         assert_eq!(hit.kind, CryptoKind::PgpInline);
         assert!(hit.payload.starts_with(b"-----BEGIN PGP MESSAGE-----"));
+    }
+
+    #[test]
+    fn detects_smime_clear_signed() {
+        let raw = "From: a@example.com\r\nSubject: t\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/signed; protocol=\"application/x-pkcs7-signature\"; micalg=sha-256; boundary=BB\r\n\r\n\
+This is an S/MIME signed message\r\n\
+--BB\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nvisible body\r\n\
+--BB\r\nContent-Type: application/x-pkcs7-signature; name=\"smime.p7s\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\nQUJDREVG\r\n\
+--BB--\r\n";
+        let hit = detect(raw.as_bytes()).expect("must detect");
+        assert_eq!(hit.kind, CryptoKind::SmimeClearSigned);
+        assert!(!hit.kind.is_encrypted());
+        assert_eq!(hit.part_id, "1.2");
+        assert_eq!(hit.payload, b"ABCDEF");
+    }
+
+    #[test]
+    fn clear_signed_accepts_both_protocol_spellings() {
+        for protocol in [
+            "application/pkcs7-signature",
+            "application/x-pkcs7-signature",
+        ] {
+            let raw = format!(
+                "Content-Type: multipart/signed; protocol=\"{protocol}\"; boundary=BB\r\n\r\n\
+--BB\r\nContent-Type: text/plain\r\n\r\nx\r\n\
+--BB\r\nContent-Type: {protocol}\r\nContent-Transfer-Encoding: base64\r\n\r\nQUJD\r\n\
+--BB--\r\n"
+            );
+            assert!(detect(raw.as_bytes()).is_some(), "protocol {protocol}");
+        }
+    }
+
+    #[test]
+    fn pgp_clear_signed_is_not_detected() {
+        // PGP clear-signed mail is out of scope in step 1 (no verification).
+        let raw = "Content-Type: multipart/signed; protocol=\"application/pgp-signature\"; boundary=BB\r\n\r\n\
+--BB\r\nContent-Type: text/plain\r\n\r\n-----BEGIN PGP SIGNED MESSAGE-----\r\nhi\r\n\
+--BB\r\nContent-Type: application/pgp-signature\r\n\r\n-----BEGIN PGP SIGNATURE-----\r\n\
+--BB--\r\n";
+        assert!(detect(raw.as_bytes()).is_none());
     }
 
     #[test]

@@ -509,9 +509,15 @@ With an account opted in:
   `inner_part_prefix` (`d1.2`); `imap_get_attachment` resolves them (and
   falls back to inner filename matching) transparently.
 - Sign-then-envelop nesting (an opaque `signed-data` part inside the
-  decrypted MIME) is unwrapped automatically. Signature verification is
-  best-effort in this step: `verified` is `null` unless the helper actually
-  verified (gpg does; `security cms` extraction does not validate chains).
+  decrypted MIME, or a clear-signed `multipart/signed` entity) is unwrapped
+  or verified automatically. Signature digests are checked: S/MIME via
+  `openssl smime -verify -noverify` (cross-platform — over the whole raw
+  message for clear-signed mail, over the embedded content for opaque
+  signed-data), PGP via gpg. `verified: true` means the digest is valid;
+  the certificate chain/trust is NOT validated (`-noverify`, trust checks
+  are a future step). `verified: null` means present but not determinable
+  (unknown PGP signer key, or an operational verification error, reported
+  via `failure_reason`).
 
 Platform backends (step 1): S/MIME uses `/usr/bin/security cms -D` (macOS;
 the private key never leaves the login keychain). PGP uses `gpg` with the

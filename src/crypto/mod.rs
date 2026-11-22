@@ -349,7 +349,9 @@ impl CryptoService {
         // Select the backend for the detected kind; disabled paths yield a
         // failure block (fail-open: original view plus explanation).
         let backend: Arc<dyn DecryptBackend> = match detected.kind {
-            detect::CryptoKind::SmimeEnveloped | detect::CryptoKind::SmimeSigned
+            detect::CryptoKind::SmimeEnveloped
+            | detect::CryptoKind::SmimeSigned
+            | detect::CryptoKind::SmimeClearSigned
                 if !account.smime_enabled =>
             {
                 return Some(Resolution {
@@ -360,9 +362,9 @@ impl CryptoService {
                     inner: None,
                 });
             }
-            detect::CryptoKind::SmimeEnveloped | detect::CryptoKind::SmimeSigned => {
-                self.smime_backend.clone()
-            }
+            detect::CryptoKind::SmimeEnveloped
+            | detect::CryptoKind::SmimeSigned
+            | detect::CryptoKind::SmimeClearSigned => self.smime_backend.clone(),
             detect::CryptoKind::PgpMime | detect::CryptoKind::PgpInline if !account.pgp_enabled => {
                 return Some(Resolution {
                     block: CryptoBlock::failure(
@@ -376,6 +378,41 @@ impl CryptoService {
                 self.pgp_backends.get(account_id)?.clone()
             }
         };
+
+        // Clear-signed mail: the content is already visible to plain
+        // parsing — nothing to decrypt or extract. Only the signature
+        // status is added, verified over the whole raw message. Operational
+        // verification errors keep the original view plus a failure_reason
+        // (fail-open).
+        if detected.kind == detect::CryptoKind::SmimeClearSigned {
+            let (verified, failure_reason_field) =
+                match backend.smime_verify_clear_signed(raw, self.timeout).await {
+                    Ok(info) => (
+                        match info.status {
+                            backend::SignatureStatus::Verified => Some(true),
+                            backend::SignatureStatus::Bad => Some(false),
+                            backend::SignatureStatus::Unverified => None,
+                        },
+                        None,
+                    ),
+                    Err(error) => (None, Some(failure_reason(error))),
+                };
+            return Some(Resolution {
+                block: CryptoBlock {
+                    scheme: detected.kind.scheme().to_owned(),
+                    encrypted: false,
+                    decrypted: false,
+                    signed: Some(true),
+                    verified,
+                    signer_cn: None,
+                    signer_email: None,
+                    failure_reason: failure_reason_field,
+                    original_part_id: detected.part_id.clone(),
+                    inner_part_prefix: INNER_PART_PREFIX.to_owned(),
+                },
+                inner: None,
+            });
+        }
 
         let outcome = match detected.kind {
             detect::CryptoKind::SmimeEnveloped => {
@@ -391,6 +428,7 @@ impl CryptoService {
             detect::CryptoKind::PgpMime | detect::CryptoKind::PgpInline => {
                 backend.pgp_decrypt(&detected.payload, self.timeout).await
             }
+            detect::CryptoKind::SmimeClearSigned => unreachable!("handled above"),
         };
         let mut outcome = match outcome {
             Ok(outcome) => outcome,
@@ -401,34 +439,54 @@ impl CryptoService {
                 });
             }
         };
+        let mut signature = outcome.signature;
 
-        // Standard sign-then-envelop mail nests an opaque signed-data part
-        // inside the decrypted MIME entity (see the "Lektion 2" structure).
-        // Unwrap it (bounded depth) so the visible body is the actual
-        // content, not the CMS wrapper.
+        // Sign-then-envelop mail nests the signature inside the decrypted
+        // MIME entity (opaque `signed-data` wrappers are unwrapped so the
+        // visible body is the actual content; a clear-signed inner part is
+        // verified in place — its content is already visible in the tree).
+        // Bounded depth.
         for _ in 0..2 {
             let Some(inner_detected) = detect::detect(&outcome.content) else {
                 break;
             };
-            if inner_detected.kind != detect::CryptoKind::SmimeSigned || !account.smime_enabled {
+            if !account.smime_enabled {
                 break;
             }
-            match self
-                .smime_backend
-                .smime_signed_content(&inner_detected.payload, self.timeout)
-                .await
-            {
-                Ok(nested) => outcome = nested,
-                Err(error) => {
-                    return Some(Resolution {
-                        block: CryptoBlock::failure(&detected, failure_reason(error)),
-                        inner: None,
-                    });
+            match inner_detected.kind {
+                detect::CryptoKind::SmimeSigned => {
+                    match self
+                        .smime_backend
+                        .smime_signed_content(&inner_detected.payload, self.timeout)
+                        .await
+                    {
+                        Ok(nested) => {
+                            outcome = nested;
+                            signature = outcome.signature;
+                        }
+                        Err(error) => {
+                            return Some(Resolution {
+                                block: CryptoBlock::failure(&detected, failure_reason(error)),
+                                inner: None,
+                            });
+                        }
+                    }
                 }
+                detect::CryptoKind::SmimeClearSigned => {
+                    // Verify over the decrypted inner MIME (the
+                    // multipart/signed entity as the sender assembled it).
+                    signature = backend
+                        .smime_verify_clear_signed(&outcome.content, self.timeout)
+                        .await
+                        .ok()
+                        .or(signature);
+                    break;
+                }
+                _ => break,
             }
         }
 
-        let signature = outcome.signature.as_ref();
+        let signature = signature.as_ref();
         let (signer_cn, signer_email) = signature
             .and_then(|s| s.signer.as_deref())
             .map(split_signer)
