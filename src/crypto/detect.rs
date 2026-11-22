@@ -6,9 +6,11 @@
 //! - S/MIME enveloped-data and opaque signed-data (`application/pkcs7-mime`,
 //!   `smime-type=enveloped-data|signed-data`) — the payload is the decoded
 //!   part body (DER `ContentInfo`).
-//! - PGP/MIME (`multipart/encrypted` with `protocol="application/pgp-encrypted"`)
-//!   — the payload is the decoded body of the `application/octet-stream` part
-//!   (typically armored `encrypted.asc`).
+//! - PGP/MIME: an `application/pgp-encrypted` version marker with the
+//!   ciphertext in a sibling `application/octet-stream`/text part. Both the
+//!   RFC 3156 `multipart/encrypted` shape and the flat sibling variant
+//!   inside `multipart/mixed` (seen from ProtonMail in the wild) are
+//!   detected.
 //! - Inline PGP (a `text/*` body that starts with the ASCII armor header).
 //!
 //! Clear-signed structures (`multipart/signed`) are deliberately NOT
@@ -75,19 +77,40 @@ fn walk(part: &ParsedMail<'_>, part_id: &str) -> Option<Detected> {
         return inspect_leaf(part, part_id);
     }
 
-    let ctype = part.ctype.mimetype.to_ascii_lowercase();
-    if ctype == "multipart/encrypted"
-        && part
-            .ctype
-            .params
-            .get("protocol")
-            .is_some_and(|p| p.eq_ignore_ascii_case("application/pgp-encrypted"))
-    {
-        // RFC 3156: part 1 = version, part 2 = octet-stream ciphertext.
+    // RFC 3156 wraps PGP/MIME in `multipart/encrypted` with a protocol
+    // parameter, but real-world senders (ProtonMail, verified on a live
+    // incoming application mail) also place the version marker and the
+    // ciphertext as plain siblings inside a `multipart/mixed`. Detect via
+    // the `application/pgp-encrypted` marker part in either shape: the
+    // payload is the sibling `application/octet-stream` part.
+    let has_pgp_marker = part.subparts.iter().any(|sub| {
+        sub.ctype
+            .mimetype
+            .eq_ignore_ascii_case("application/pgp-encrypted")
+    });
+    if has_pgp_marker {
+        // The ciphertext part is `application/octet-stream` in both shapes.
+        // A plain `text/plain` sibling is a body, not the payload — unless it
+        // carries armor directly (rare inline fallback).
         for (idx, sub) in part.subparts.iter().enumerate() {
-            let sub_ctype = sub.ctype.mimetype.to_ascii_lowercase();
-            if sub_ctype == "application/octet-stream" || sub_ctype == "text/plain" {
-                let payload = sub.get_body_raw().ok()?;
+            if sub
+                .ctype
+                .mimetype
+                .eq_ignore_ascii_case("application/octet-stream")
+                && let Ok(payload) = sub.get_body_raw()
+            {
+                return Some(Detected {
+                    kind: CryptoKind::PgpMime,
+                    payload,
+                    part_id: format!("{part_id}.{}", idx + 1),
+                });
+            }
+        }
+        for (idx, sub) in part.subparts.iter().enumerate() {
+            if sub.ctype.mimetype.eq_ignore_ascii_case("text/plain")
+                && let Ok(payload) = sub.get_body_raw()
+                && payload.starts_with(b"-----BEGIN PGP MESSAGE-----")
+            {
                 return Some(Detected {
                     kind: CryptoKind::PgpMime,
                     payload,
@@ -217,6 +240,28 @@ h4IBDQ==\r\n\
         let hit = detect(raw.as_bytes()).expect("must detect");
         assert_eq!(hit.kind, CryptoKind::PgpMime);
         assert_eq!(hit.part_id, "1.2");
+        assert_eq!(hit.payload, b"\x87\x82\x01\x0d".as_slice());
+    }
+
+    #[test]
+    fn detects_pgp_mime_protonmail_flat_siblings() {
+        // Real-world shape (verified on a live ProtonMail application mail):
+        // no multipart/encrypted wrapper — the version marker and the
+        // ciphertext sit as plain siblings inside a multipart/mixed.
+        let raw = "From: a@example.com\r\nSubject: t\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=BB\r\n\r\n\
+--BB\r\nContent-Type: text/plain\r\n\r\n\r\n\
+--BB\r\nContent-Type: application/pgp-encrypted; name=\"PGPMIME version identification\"\r\n\
+Content-Disposition: attachment; filename=\"PGPMIME version identification\"\r\n\r\n\
+Version: 1\r\n\
+--BB\r\nContent-Type: application/octet-stream; name=\"encrypted.asc\"\r\n\
+Content-Disposition: attachment; filename=\"encrypted.asc\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n\
+h4IBDQ==\r\n\
+--BB--\r\n";
+        let hit = detect(raw.as_bytes()).expect("must detect");
+        assert_eq!(hit.kind, CryptoKind::PgpMime);
+        assert_eq!(hit.part_id, "1.3");
         assert_eq!(hit.payload, b"\x87\x82\x01\x0d".as_slice());
     }
 

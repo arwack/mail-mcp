@@ -240,13 +240,19 @@ impl DecryptBackend for GpgBackend {
             args.push(input.path().display().to_string());
 
             let out = run_helper(&self.bin, &args, stdin, &self.extra_env, timeout).await?;
-            if !out.status.success() {
+            if !out.status.success() && out.stdout.is_empty() {
                 let reason = String::from_utf8_lossy(&out.stderr).trim().to_owned();
                 return Err(CryptoStepError::new(
                     CryptoErrorKind::ProcessFailed,
                     format!("gpg failed: {reason}"),
                 ));
             }
+            // A nonzero exit WITH plaintext on stdout means the decryption
+            // itself succeeded and only signature verification failed (e.g.
+            // the signer's key is unknown: "Can't check signature: No public
+            // key"). OpenPGP decryption is all-or-nothing (integrity
+            // protected), so the stdout content is complete — keep it and
+            // let the signature classification report what happened.
             let signature = classify_gpg_signature(&out.stderr);
             Ok(DecryptOutcome {
                 content: out.stdout,
@@ -256,11 +262,13 @@ impl DecryptBackend for GpgBackend {
     }
 }
 
-/// Extract signature status from gpg stderr (successful decrypt).
+/// Extract signature status from gpg stderr.
 ///
 /// gpg verifies one-pass signatures during `--decrypt` and reports the result
 /// on stderr. Absence of any signature lines means the message was encrypted
-/// without a signature (or the status could not be determined).
+/// without a signature (or the status could not be determined). An
+/// unverifiable signature (unknown signer key — "Can't check signature") is
+/// reported as present-but-unverified, not as a decryption failure.
 fn classify_gpg_signature(stderr: &[u8]) -> Option<SignatureInfo> {
     let text = String::from_utf8_lossy(stderr);
     for line in text.lines() {
@@ -275,6 +283,12 @@ fn classify_gpg_signature(stderr: &[u8]) -> Option<SignatureInfo> {
             return Some(SignatureInfo {
                 status: SignatureStatus::Verified,
                 signer: Some(signer),
+            });
+        }
+        if line.contains("Can't check signature") {
+            return Some(SignatureInfo {
+                status: SignatureStatus::Unverified,
+                signer: None,
             });
         }
         if line.contains("BAD signature") || line.contains("BADsignature") {
@@ -478,6 +492,17 @@ mod signature_tests {
         let stderr = b"gpg: BAD signature from \"Evil <e@example.com>\"";
         let info = classify_gpg_signature(stderr).expect("signature expected");
         assert_eq!(info.status, SignatureStatus::Bad);
+    }
+
+    #[test]
+    fn unverifiable_signature_is_present_but_unverified() {
+        // Real-world shape (live ProtonMail application mail): decryption
+        // succeeds, the signer's key is unknown, gpg exits nonzero but has
+        // written the full plaintext to stdout.
+        let stderr = b"gpg: encrypted with rsa4096 key, ID DA8BF8F6A1FA1000\ngpg: Signature made Sun Nov  8 19:53:13 2026 CET\ngpg:                using EDDSA key 0C2938DB1E644840\ngpg: Can't check signature: No public key";
+        let info = classify_gpg_signature(stderr).expect("signature expected");
+        assert_eq!(info.status, SignatureStatus::Unverified);
+        assert_eq!(info.signer, None);
     }
 
     #[test]
